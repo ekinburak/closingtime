@@ -1,0 +1,28 @@
+name: Prepare prototype binaries
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --locked
+      - run: python3 tests/terminal_smoke.py --binary target/debug/closingtime
+      - run: python3 scripts/package-release.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: closingtime-prototype-${{ matrix.os }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14

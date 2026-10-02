@@ -1,0 +1,16 @@
+[package]
+name = "closingtime"
+description = "Record what a coding-agent run starts and review what survives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+closingtime-core = { path = "../closingtime-core" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+signal-hook.workspace = true
+signal-hook-registry.workspace = true
+libc.workspace = true

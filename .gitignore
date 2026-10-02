@@ -1,0 +1,19 @@
+/target/
+/dist/
+/.closingtime/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+
+# Private discovery research is retained locally, outside the source distribution.
+/agent-leftovers-prd.docx
+
+# The landing page lives in the separate closingtime-website project.
+# Keep private site/tooling files out if they are copied here accidentally.
+/website/
+/.impeccable/
+/.playwright-mcp/

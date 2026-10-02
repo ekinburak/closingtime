@@ -621,6 +621,46 @@ fn lsof_parser_handles_ipv6_duplicate_fds_and_multiple_listeners() {
 }
 
 #[test]
+fn service_cgroups_are_relative_to_the_supervisor_unit() {
+    use crate::platform::{service_managed, systemd_cgroup};
+    assert_eq!(
+        systemd_cgroup("12:cpu:/x\n1:name=systemd:/system.slice/a.service\n0::/other\n"),
+        Some("/system.slice/a.service")
+    );
+    assert_eq!(systemd_cgroup("0::/user.slice\n"), Some("/user.slice"));
+    assert_eq!(systemd_cgroup("12:cpu:/x\n"), None);
+
+    let runner = "/system.slice/hosted-compute-agent.service";
+    // Children of a supervisor running inside a service inherit its unit.
+    assert!(!service_managed(runner, Some(runner)));
+    assert!(!service_managed(&format!("{runner}/job"), Some(runner)));
+    // A different or nested unit was placed there by a manager.
+    assert!(service_managed(
+        "/system.slice/postgresql.service",
+        Some(runner)
+    ));
+    assert!(service_managed(
+        &format!("{runner}/db.service"),
+        Some(runner)
+    ));
+    assert!(service_managed(
+        &format!("{runner}-x/db.service"),
+        Some(runner)
+    ));
+    // Without a readable supervisor cgroup, keep the conservative check.
+    assert!(service_managed(runner, None));
+    let user = "/user.slice/user-1000.slice/user@1000.service";
+    assert!(!service_managed(
+        &format!("{user}/app.slice/vte-spawn-1.scope"),
+        None
+    ));
+    assert!(service_managed(
+        &format!("{user}/app.slice/web.service"),
+        Some("/")
+    ));
+}
+
+#[test]
 fn scan_200_recorded_processes_latency() {
     let (_dir, engine, s) = setup();
     let mut records = Vec::new();

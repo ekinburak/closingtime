@@ -23,6 +23,10 @@ pub struct NativeBackend {
     host: String,
     boot: String,
     uid: u32,
+    /// The supervisor's own systemd cgroup. Descendants that stay inside it were
+    /// not placed there by a service manager, even when it is a `.service` unit.
+    #[cfg(target_os = "linux")]
+    cgroup: Option<String>,
 }
 impl NativeBackend {
     pub fn new() -> Result<Self> {
@@ -31,6 +35,10 @@ impl NativeBackend {
             host,
             boot,
             uid: unsafe { libc::geteuid() },
+            #[cfg(target_os = "linux")]
+            cgroup: fs::read_to_string("/proc/self/cgroup")
+                .ok()
+                .and_then(|text| systemd_cgroup(&text).map(str::to_owned)),
         })
     }
     pub fn doctor(&self) -> Result<Doctor> {
@@ -265,11 +273,8 @@ fn inspect_native(backend: &NativeBackend, pid: u32) -> Inspection {
         };
         let manager_owned = fs::read_to_string(format!("/proc/{pid}/cgroup"))
             .ok()
-            .map(|s| {
-                s.lines().any(|l| {
-                    l.split('/')
-                        .any(|part| part.ends_with(".service") && !part.starts_with("user@"))
-                })
+            .and_then(|text| {
+                systemd_cgroup(&text).map(|path| service_managed(path, backend.cgroup.as_deref()))
             });
         if read_linux_stat(pid)?.2 != start {
             return Err("process identity changed during inspection".into());
@@ -301,6 +306,33 @@ fn inspect_native(backend: &NativeBackend, pid: u32) -> Inspection {
         }
         Err(e) => Inspection::Unavailable(e.to_string()),
     }
+}
+
+/// The v1 `name=systemd` hierarchy on legacy/hybrid hosts, else the unified (v2) path.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn systemd_cgroup(text: &str) -> Option<&str> {
+    let hierarchy = |name: &str| {
+        text.lines().find_map(|line| {
+            let mut fields = line.splitn(3, ':');
+            fields.next()?;
+            (fields.next()? == name).then(|| fields.next()).flatten()
+        })
+    };
+    hierarchy("name=systemd").or_else(|| hierarchy(""))
+}
+
+/// A `.service` unit (other than the per-user manager) owns the process, unless it is
+/// the supervisor's own unit: a CI runner or SSH service is not a separate manager.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn service_managed(path: &str, own: Option<&str>) -> bool {
+    let relative = own
+        .filter(|own| *own != "/")
+        .and_then(|own| path.strip_prefix(own))
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        .unwrap_or(path);
+    relative
+        .split('/')
+        .any(|part| part.ends_with(".service") && !part.starts_with("user@"))
 }
 
 #[cfg(target_os = "linux")]

@@ -6,8 +6,8 @@
 </p>
 
 <p align="center">
-  <strong>Know which agent run left that port open.</strong><br>
-  <sub>Recorded ownership. Intentional keeps. Cleanup you review.</sub>
+  <strong>Know what your agents leave behind.</strong><br>
+  <sub>Trace it to a run. Keep what matters. Review the cleanup.</sub>
 </p>
 
 <p align="center">
@@ -37,11 +37,13 @@
 
 Closingtime is an open-source CLI and Rust library that records process ownership for coding-agent runs, explains what survives, and lets you review cleanup before stopping anything. It runs offline, with no account or telemetry.
 
+The current prototype covers processes and their TCP listening ports. Worktrees and temporary files/directories are on the [roadmap](TODO.md#additional-resource-classes).
+
 > **Prototype status.** The core has been tested locally on macOS and in Linux containers. Real agent workload testing, hosted CI and public binary releases remain pending. See the [validation record](docs/validation.md) for evidence and limitations.
 
-## The agent finished. Its server didn't.
+## The agent finished. The leftovers stayed.
 
-A listening port tells you something is running. Closingtime helps explain **which recorded run owns it**, where that run started, and why the process is—or is not—eligible for cleanup.
+A running process or listening port tells you something is still here. Closingtime helps explain **which recorded run owns it**, where that run started, and why the process is—or is not—eligible for cleanup.
 
 - **Separate runs, even in one project.** Each wrapper invocation gets its own ID. Native agent session IDs remain separate optional metadata.
 - **Keep the evidence.** Launch registration, inherited session tags and observed ancestry are labelled separately. Recorded ownership survives reparenting.

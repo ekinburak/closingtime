@@ -28,7 +28,7 @@ The active scope is the offline processes-and-ports CLI and library in PRD.md. I
 ## Additional resource classes
 
 - [ ] Worktrees: preserve dirty/untracked/ignored content; model in-use state, commit reachability and squash merges; design and test recovery before removal.
-- [ ] Temporary directories: establish explicit ownership, quarantine identity, TTL and recovery before deletion.
+- [ ] Temporary files and directories: establish explicit ownership, quarantine identity, TTL and recovery before deletion.
 - [ ] Scheduled jobs: explicit registration and manager-aware lifecycle handling.
 - [ ] Windows: Job Objects, identity collectors and native safety fixtures.
 - [ ] Cloud sandbox inventory: read vendors' full lifecycle documentation, validate API support and distinguish sandbox stop from external-resource cleanup.

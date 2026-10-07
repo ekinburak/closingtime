@@ -254,6 +254,36 @@ fn cli_wrapper_preserves_exit_status_and_rejects_piped_apply() {
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("noninteractive cleanup is refused"));
     assert!(data.actions.is_empty());
+    let id = &data.sessions[0].id;
+    for selector in [vec!["--last"], vec!["--session", &id[..8]]] {
+        let preview = Command::new(binary)
+            .arg("--state-dir")
+            .arg(&dir.0)
+            .arg("clean")
+            .args(&selector)
+            .output()
+            .unwrap();
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
+        assert!(String::from_utf8_lossy(&preview.stdout).contains(id.as_str()));
+    }
+    let recover = Command::new(binary)
+        .arg("--state-dir")
+        .arg(&dir.0)
+        .args(["recover", "--last"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&recover.stderr).contains("already ended"));
+    let missing = Command::new(binary)
+        .arg("--state-dir")
+        .arg(&dir.0)
+        .args(["clean", "--session", "zz"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no recorded run matches zz"));
 }
 
 #[test]

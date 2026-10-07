@@ -27,7 +27,7 @@ closingtime unkeep --pid 12345
 closingtime export --json
 ```
 
-`run` inherits the terminal and returns the command's exit status. It records a separate run ID for every invocation, sets `CLOSINGTIME_SESSION` and `CLOSINGTIME_PROJECT`, and observes descendants every 250 ms while the root runs. Observation writes are batched. It performs a final observation after the root exits. Nothing is automatically reaped.
+`run` inherits the terminal and returns the command's exit status. It records a separate run ID for every invocation, sets `CLOSINGTIME_SESSION` and `CLOSINGTIME_PROJECT`, and observes descendants every 250 ms while the root runs. Observation writes are batched. A failed pass is retried on the next one and counted in the run outcome; unrecorded processes are never cleanup targets. It performs a final observation after the root exits, and if that fails the run stays unconfirmed. Nothing is automatically reaped.
 
 Terminal Ctrl-C reaches the child through its foreground process group, without a duplicate forwarded interrupt. On macOS, an explicitly sent SIGINT to the wrapper while it shares that foreground group cannot be distinguished from terminal Ctrl-C and is not forwarded. Use SIGTERM to interrupt the wrapper externally; SIGINT is forwarded when there is no shared foreground terminal group.
 
@@ -43,11 +43,13 @@ Each target must have a recorded owner, a confirmed ended run, a matching curren
 
 Keep decisions cover known descendants even after reparenting. If a detached process has incomplete ancestry and its run contains a keep, it stays report-only. Removing a child's explicit keep does not override a kept ancestor.
 
-Closingtime signals one verified process at a time: SIGTERM, a three-second grace period, then SIGKILL if it remains eligible. Linux uses pidfds and refuses to fall back to an ordinary PID kill. macOS rechecks kernel start time immediately before signaling, but Darwin has no pidfd equivalent: a remaining PID reuse race is documented, not claimed away. Zombies are reported as awaiting parent reaping.
+Closingtime signals individual verified processes: SIGTERM to each reviewed target, one shared three-second grace period, then SIGKILL for any survivor that remains eligible. Linux uses pidfds and refuses to fall back to an ordinary PID kill. macOS rechecks kernel start time immediately before signaling, but Darwin has no pidfd equivalent: a remaining PID reuse race is documented, not claimed away. Zombies are reported as awaiting parent reaping.
 
 Other users' processes, Closingtime, its invoking ancestors, system processes, known IDE/terminal main processes, and manager-owned services are excluded. A recorded positive manager observation is preserved for that identity and its observed descendants. Unavailable launchd or service metadata blocks eligibility. Manager-aware stops are future work.
 
-Missing end events, failed observations, and forced supervisor crashes leave the run unconfirmed and report-only. An embedding harness can call `end_session` after verifying its root exited. The CLI does not guess that an abandoned run is safe to reap.
+Missing end events, a failed final observation, and forced supervisor crashes leave the run unconfirmed and report-only. `closingtime recover --session ID` ends such a run only after verifying that its supervisor and root have exited; it records tagged survivors first, and the normal eligibility checks still apply to every target. An embedding harness can call `recover_session` or `end_session` in the same way. Nothing is ended or reaped automatically.
+
+`closingtime prune` forgets runs, ownership records and keeps from earlier boots, whose processes cannot still exist, and ledger events older than `--event-days` (30 by default). Cleanup action history is kept.
 
 Cleanup writes durable action intent before sending a signal. If recording fails, it stops without sending further signals. Action results and evidence are available in `export`. The local SQLite history is **not** an immutable compliance log.
 
@@ -68,7 +70,7 @@ Linux identity includes the PID namespace because containers can share a kernel 
 
 ## Integrate
 
-The `closingtime-core` crate exposes `begin_session`, `spawn_owned`, `register_owned`, `observe`, `end_session`, `plan_cleanup`, `apply_plan`, and keep controls. The CLI uses the same library.
+The `closingtime-core` crate exposes `begin_session`, `spawn_owned`, `register_owned`, `observe`, `end_session`, `recover_session`, `plan_cleanup`, `apply_plan`, `prune`, and keep controls. The CLI uses the same library.
 
 - [Rust harness example](../crates/closingtime-core/examples/instrument.rs)
 - [Python export reader](../examples/python_reader.py)

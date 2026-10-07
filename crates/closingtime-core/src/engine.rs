@@ -487,37 +487,50 @@ impl<B: Backend> Engine<B> {
             warnings: scan.warnings,
         })
     }
-    fn guarded_signal(
+    /// Recheck every target against a fresh plan, then signal those still eligible.
+    /// Per-target results are `Ok(sent)` or the refusal reason.
+    fn guarded_signals(
         &self,
         plan: &CleanupPlan,
-        reviewed: &ResourceView,
+        targets: &[&ResourceView],
         signal: i32,
-    ) -> Result<bool> {
+    ) -> Vec<std::result::Result<bool, String>> {
+        let refuse_all =
+            |e: &dyn std::fmt::Display| targets.iter().map(|_| Err(e.to_string())).collect();
+        // Read the process table before taking the write lock: a full snapshot (and lsof
+        // on macOS) can outlast concurrent observers' busy timeout. Each signal still
+        // binds to and rechecks the exact process identity.
+        let snapshot = match self.backend.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(e) => return refuse_all(&e),
+        };
         // Serialize with keep/session writers during the final check and signal.
-        self.store.connection.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<bool> {
-            let fresh = self.plan_cleanup(&plan.session_id)?;
-            let matches = fresh.resources.iter().any(|r| {
-                r.cleanup_eligible
-                    && r.identity == reviewed.identity
-                    && r.executable == reviewed.executable
-            });
-            if !matches {
-                return Ok(false);
-            }
-            self.backend.signal(&reviewed.identity, signal)?;
-            Ok(true)
-        })();
-        match result {
-            Ok(sent) => {
-                self.store.connection.execute_batch("COMMIT")?;
-                Ok(sent)
-            }
-            Err(e) => {
-                let _ = self.store.connection.execute_batch("ROLLBACK");
-                Err(e)
-            }
+        if let Err(e) = self.store.connection.execute_batch("BEGIN IMMEDIATE") {
+            return refuse_all(&e);
         }
+        let results = match self.scan_snapshot(&snapshot, Some(&plan.session_id)) {
+            Ok(fresh) => targets
+                .iter()
+                .map(|reviewed| {
+                    let matches = fresh.resources.iter().any(|r| {
+                        r.cleanup_eligible
+                            && r.identity == reviewed.identity
+                            && r.executable == reviewed.executable
+                    });
+                    if !matches {
+                        return Ok(false);
+                    }
+                    self.backend
+                        .signal(&reviewed.identity, signal)
+                        .map(|()| true)
+                        .map_err(|e| e.to_string())
+                })
+                .collect(),
+            Err(e) => refuse_all(&e),
+        };
+        // The transaction only held the lock; nothing was written.
+        let _ = self.store.connection.execute_batch("ROLLBACK");
+        results
     }
     pub fn apply_plan(
         &self,
@@ -527,9 +540,14 @@ impl<B: Backend> Engine<B> {
         if plan.schema != SCHEMA || approval.session_id != plan.session_id {
             return Err("approval/schema does not match the plan".into());
         }
+        let targets: Vec<_> = plan
+            .resources
+            .iter()
+            .filter(|r| r.cleanup_eligible)
+            .collect();
         let mut actions = Vec::new();
-        for resource in plan.resources.iter().filter(|r| r.cleanup_eligible) {
-            let mut action = Action {
+        for resource in &targets {
+            let action = Action {
                 id: new_id()?,
                 session_id: plan.session_id.clone(),
                 identity: resource.identity.clone(),
@@ -540,50 +558,107 @@ impl<B: Backend> Engine<B> {
                 signals: Vec::new(),
                 evidence: resource.evidence.clone(),
             };
-            // Durable intent first. If the ledger is broken, do not signal.
-            self.store.save_action(&action)?;
-            match self.guarded_signal(plan, resource, libc::SIGTERM) {
-                Ok(false) => action.result = "skipped_after_recheck".into(),
-                Err(e) => action.result = format!("refused: {e}"),
-                Ok(true) => {
-                    action.signals.push("SIGTERM".into());
-                    self.store.save_action(&action)?;
-                    let deadline = Instant::now() + Duration::from_secs(3);
-                    while Instant::now() < deadline
-                        && still_running(&self.backend, &resource.identity)
-                    {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    if still_running(&self.backend, &resource.identity) {
-                        match self.guarded_signal(plan, resource, libc::SIGKILL) {
-                            Ok(true) => {
-                                action.signals.push("SIGKILL".into());
-                            }
-                            Ok(false) => action.result = "escalation_skipped_after_recheck".into(),
-                            Err(e) => action.result = format!("escalation_refused: {e}"),
-                        }
-                        let deadline = Instant::now() + Duration::from_secs(1);
-                        while Instant::now() < deadline
-                            && still_running(&self.backend, &resource.identity)
-                        {
-                            std::thread::sleep(Duration::from_millis(25));
-                        }
-                    }
-                    if action.result == "pending" {
-                        action.result = if still_running(&self.backend, &resource.identity) {
-                            "still_running"
-                        } else {
-                            "stopped_or_awaiting_reaping"
-                        }
-                        .into();
-                    }
-                }
-            }
-            action.finished_ms = Some(now_ms());
+            // Durable intent first. If the ledger is broken, do not signal anything.
             self.store.save_action(&action)?;
             actions.push(action);
         }
+        // Signal the whole plan, then wait once, so cleanup time does not grow per process.
+        let terms = self.guarded_signals(plan, &targets, libc::SIGTERM);
+        for (action, sent) in actions.iter_mut().zip(terms) {
+            match sent {
+                Ok(true) => {
+                    action.signals.push("SIGTERM".into());
+                    self.store.save_action(action)?;
+                }
+                Ok(false) => action.result = "skipped_after_recheck".into(),
+                Err(e) => action.result = format!("refused: {e}"),
+            }
+        }
+        wait_until_stopped(
+            &self.backend,
+            &actions,
+            Duration::from_secs(3),
+            Duration::from_millis(50),
+        );
+        let survivors: Vec<_> = (0..actions.len())
+            .filter(|&i| {
+                actions[i].result == "pending" && still_running(&self.backend, &actions[i].identity)
+            })
+            .collect();
+        if !survivors.is_empty() {
+            let reviewed: Vec<_> = survivors.iter().map(|&i| targets[i]).collect();
+            let kills = self.guarded_signals(plan, &reviewed, libc::SIGKILL);
+            for (&i, sent) in survivors.iter().zip(kills) {
+                match sent {
+                    Ok(true) => actions[i].signals.push("SIGKILL".into()),
+                    Ok(false) => actions[i].result = "escalation_skipped_after_recheck".into(),
+                    Err(e) => actions[i].result = format!("escalation_refused: {e}"),
+                }
+            }
+            wait_until_stopped(
+                &self.backend,
+                &actions,
+                Duration::from_secs(1),
+                Duration::from_millis(25),
+            );
+        }
+        for action in &mut actions {
+            if action.result == "pending" {
+                action.result = if still_running(&self.backend, &action.identity) {
+                    "still_running"
+                } else {
+                    "stopped_or_awaiting_reaping"
+                }
+                .into();
+            }
+            action.finished_ms = Some(now_ms());
+            self.store.save_action(action)?;
+        }
         Ok(actions)
+    }
+    /// End a run whose supervisor exited without ending it (a crash, `kill -9`, or a
+    /// recording failure). Requires the supervisor and the run's root to be gone, records
+    /// tagged survivors first, and leaves anything unverifiable report-only as usual.
+    pub fn recover_session(&self, session_id: &str) -> Result<()> {
+        let session = self.store.session(session_id)?;
+        self.validate_session(&session)?;
+        if session.state != SessionState::Active {
+            return Err("run has already ended".into());
+        }
+        match self.backend.inspect(session.supervisor.pid) {
+            Inspection::Present(p) if p.identity == session.supervisor && !p.zombie => {
+                return Err("its supervisor is still running and will end the run itself".into());
+            }
+            Inspection::Unavailable(e) => {
+                return Err(format!("cannot verify that its supervisor exited: {e}").into());
+            }
+            _ => {}
+        }
+        self.observe()?;
+        self.end_session(session_id, "recovered_after_supervisor_exit")
+    }
+    /// Forget runs from another host or boot (their processes cannot still exist) and
+    /// ledger events older than `events_older_than`. Action history is kept.
+    pub fn prune(&self, events_older_than: Duration) -> Result<Pruned> {
+        let cutoff = now_ms().saturating_sub(events_older_than.as_millis() as u64);
+        self.store
+            .prune(self.backend.host(), self.backend.boot(), cutoff)
+    }
+}
+
+fn wait_until_stopped<B: Backend>(
+    backend: &B,
+    actions: &[Action],
+    limit: Duration,
+    poll: Duration,
+) {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline
+        && actions
+            .iter()
+            .any(|a| a.result == "pending" && still_running(backend, &a.identity))
+    {
+        std::thread::sleep(poll);
     }
 }
 

@@ -218,6 +218,41 @@ impl Store {
         )?;
         Ok(())
     }
+    pub(crate) fn prune(&self, host: &str, boot: &str, events_before_ms: u64) -> Result<Pruned> {
+        self.require_write()?;
+        let elsewhere = |identity: &ProcessIdentity| identity.host != host || identity.boot != boot;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let mut pruned = Pruned::default();
+        for session in self.sessions()? {
+            if session.host != host || session.boot != boot {
+                pruned.sessions += tx.execute("DELETE FROM sessions WHERE id=?", [&session.id])?;
+            }
+        }
+        for record in self.records()? {
+            if elsewhere(&record.identity) {
+                pruned.processes += tx.execute(
+                    "DELETE FROM processes WHERE identity=?",
+                    [record.identity.key()],
+                )?;
+            }
+        }
+        for key in self.kept()? {
+            // A key that no longer parses cannot match any live process either.
+            if serde_json::from_str(&key).map_or(true, |id: ProcessIdentity| elsewhere(&id)) {
+                pruned.keeps += tx.execute("DELETE FROM keeps WHERE identity=?", [&key])?;
+            }
+        }
+        pruned.events = tx.execute(
+            "DELETE FROM events WHERE at_ms < ?",
+            [events_before_ms as i64],
+        )?;
+        tx.execute(
+            "INSERT INTO events(at_ms,kind,data) VALUES (?,?,?)",
+            params![now_ms() as i64, "prune", serde_json::to_string(&pruned)?],
+        )?;
+        tx.commit()?;
+        Ok(pruned)
+    }
     pub fn export(&self) -> Result<Export> {
         // A consistent snapshot across all tables, including concurrent writers.
         let tx = self.connection.unchecked_transaction()?;

@@ -9,7 +9,7 @@ The active scope is the offline processes-and-ports CLI and library in PRD.md. I
 - [ ] Repeat native list/lookup latency checks on representative developer machines and measure sustained observation overhead. The current suite includes 200 live recorded processes; model timing remains separate.
 - [ ] Expand independently labelled safety scenarios and review the unsafe platform boundary.
 - [ ] Decide whether macOS's residual PID reuse race is acceptable for alpha cleanup or warrants report-only distribution.
-- [ ] Document a harness-assisted recovery flow for runs with missing end events; avoid unsafe 'mark ended' shortcuts.
+- [x] Recover runs with missing end events only after verifying the supervisor and root exited (`closingtime recover`, `recover_session`); no unverified 'mark ended' shortcut.
 - [ ] Check project/crate name availability, repository location, release packaging and support policy.
 - [ ] Add signed/checksummed release binaries and a Homebrew tap only after release approval.
   - [x] Prepare a native archive/checksum builder and a manual CI artifact workflow. Public downloads, hosted execution, signing and Homebrew remain pending.

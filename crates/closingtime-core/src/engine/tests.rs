@@ -621,6 +621,101 @@ fn lsof_parser_handles_ipv6_duplicate_fds_and_multiple_listeners() {
 }
 
 #[test]
+fn cleanup_signals_every_target_before_waiting() {
+    let (_dir, engine, s) = setup();
+    for pid in [2_100_000, 2_100_001, 2_100_002] {
+        record(&engine, &s, pid);
+    }
+    engine.end_session(&s.id, "done").unwrap();
+    let plan = engine.plan_cleanup(&s.id).unwrap();
+    let actions = engine
+        .apply_plan(&plan, ReviewedApproval::for_plan(&plan))
+        .unwrap();
+    assert_eq!(actions.len(), 3);
+    assert!(
+        actions
+            .iter()
+            .all(|a| a.result == "stopped_or_awaiting_reaping" && a.signals == vec!["SIGTERM"])
+    );
+    assert_eq!(engine.store.actions().unwrap().len(), 3);
+}
+
+#[test]
+fn recover_requires_exited_supervisor_and_root() {
+    let (_dir, engine, s) = setup();
+    let root = record(&engine, &s, 2_200_000);
+    let mut session = engine.store.session(&s.id).unwrap();
+    session.root = Some(root.identity.clone());
+    engine.store.save_session(&session).unwrap();
+    // Our own process is the recorded supervisor here.
+    let err = engine.recover_session(&s.id).unwrap_err().to_string();
+    assert!(err.contains("supervisor is still running"), "{err}");
+    engine.backend.remove(std::process::id());
+    assert!(engine.recover_session(&s.id).is_err(), "root still running");
+    engine.backend.remove(root.identity.pid);
+    let tagged = process(2_200_001, engine.backend.uid, Some(&s.id));
+    engine.backend.put(tagged.clone());
+    engine.recover_session(&s.id).unwrap();
+    let ended = engine.store.session(&s.id).unwrap();
+    assert_eq!(ended.state, SessionState::Ended);
+    assert_eq!(
+        ended.outcome.as_deref(),
+        Some("recovered_after_supervisor_exit")
+    );
+    // Tagged survivors are recorded before the run ends.
+    assert!(
+        engine
+            .store
+            .records()
+            .unwrap()
+            .iter()
+            .any(|r| r.identity == tagged.identity)
+    );
+    assert!(engine.recover_session(&s.id).is_err(), "already ended");
+}
+
+#[test]
+fn prune_forgets_other_boots_and_old_events_only() {
+    let (_dir, engine, s) = setup();
+    let current = record(&engine, &s, 2_300_000);
+    engine.set_keep(current.identity.pid, true).unwrap();
+    let mut old = engine.store.session(&s.id).unwrap();
+    old.id = "old-boot-run".into();
+    old.boot = "previous".into();
+    engine.store.save_session(&old).unwrap();
+    let mut stale = engine.store.records().unwrap()[0].clone();
+    stale.identity.boot = "previous".into();
+    stale.session_id = old.id.clone();
+    engine.store.save_record(&stale).unwrap();
+    engine.store.set_keep(&stale.identity.key(), true).unwrap();
+    engine
+        .store
+        .connection
+        .execute(
+            "INSERT INTO events(at_ms,kind,data) VALUES (0,'old','{}')",
+            [],
+        )
+        .unwrap();
+
+    let pruned = engine
+        .prune(std::time::Duration::from_secs(86_400))
+        .unwrap();
+    assert_eq!(
+        (
+            pruned.sessions,
+            pruned.processes,
+            pruned.keeps,
+            pruned.events
+        ),
+        (1, 1, 1, 1)
+    );
+    let export = engine.store.export().unwrap();
+    assert_eq!(export.sessions.len(), 1);
+    assert_eq!(export.processes.len(), 1);
+    assert!(export.kept.contains(&current.identity.key()));
+}
+
+#[test]
 fn service_cgroups_are_relative_to_the_supervisor_unit() {
     use crate::platform::{service_managed, systemd_cgroup};
     assert_eq!(

@@ -174,3 +174,11 @@ pub struct Doctor {
     pub pidfd_available: bool,
     pub warnings: Vec<String>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Pruned {
+    pub sessions: usize,
+    pub processes: usize,
+    pub keeps: usize,
+    pub events: usize,
+}

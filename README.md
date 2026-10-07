@@ -89,10 +89,10 @@ The child inherits normal terminal input/output and its exit status is preserved
 ```sh
 closingtime sessions
 closingtime who --port 3000
-closingtime scan --session RUN_ID
+closingtime scan --last
 ```
 
-Replace `RUN_ID` with the printed ID. An unknown process stays unknown; a shared directory alone never establishes ownership.
+`--last` selects the most recent run; `--session` accepts a full run ID or any unique prefix of one. An unknown process stays unknown; a shared directory alone never establishes ownership.
 
 If a recorded server is intentional, preserve its current identity:
 
@@ -103,8 +103,8 @@ closingtime keep --pid 12345
 Then review the run:
 
 ```sh
-closingtime clean --session RUN_ID          # Preview only
-closingtime clean --session RUN_ID --apply  # Fresh checks + type yes in a terminal
+closingtime clean --last          # Preview only
+closingtime clean --last --apply  # Fresh checks + type yes in a terminal
 ```
 
 The example PID is illustrative. Select the actual PID from your ownership lookup. Nothing is automatically cleaned up when a run ends.
@@ -115,10 +115,12 @@ The example PID is illustrative. Select the actual PID from your ownership looku
 |---|---|
 | `run -- <command>` | Start a recorded run, tag the child and observe descendants. |
 | `sessions` | List runs, lifecycle state and surviving resources. |
-| `scan [--session ID]` | Show recorded resources, ownership evidence and cleanup eligibility. |
+| `scan [--session ID \| --last]` | Show recorded resources, ownership evidence and cleanup eligibility. |
 | `who --port PORT` / `who --pid PID` | Explain a current listener or process; report unknown ownership honestly. |
-| `clean --session ID` | Preview eligible actions without changing ownership or decisions. |
-| `clean --session ID --apply` | Refresh the preview, require interactive confirmation and recheck every target. |
+| `clean --session ID` / `clean --last` | Preview eligible actions without changing ownership or decisions. |
+| `clean ... --apply` | Refresh the preview, require interactive confirmation and recheck every target. |
+| `recover --session ID` / `recover --last` | End a run whose wrapper crashed or stopped recording, once its supervisor and root have exited. |
+| `prune [--event-days N]` | Forget runs and processes from earlier boots, and ledger events older than N days (default 30). |
 | `keep --pid PID` / `unkeep --pid PID` | Preserve or release a recorded identity; ancestor keeps still apply. |
 | `doctor` | Report process-identity, metadata, TCP and signal capabilities. |
 | `export --json` | Export the versioned local ledger, including action history. |
@@ -135,9 +137,9 @@ Attribution alone never authorizes a stop. Every eligible target requires:
 4. No keep decision or protection rule.
 5. Human review in the CLI, followed by another eligibility and identity check before each signal.
 
-Kept descendants, active or unconfirmed runs, other users' processes, invoking ancestors, system processes and manager-owned services are excluded. Zombies are reported as awaiting parent reaping. Missing end events stay unconfirmed.
+Kept descendants, active or unconfirmed runs, other users' processes, invoking ancestors, system processes and manager-owned services are excluded. Zombies are reported as awaiting parent reaping. Missing end events stay unconfirmed until `recover` verifies that the wrapper and the run's root have exited.
 
-Cleanup signals **individual verified processes**: SIGTERM, a three-second grace period, then another check before SIGKILL. Linux requires pidfds and has no plain-PID fallback. **macOS has a remaining identity-check/signal race**; it is reduced by immediate rechecking, not eliminated.
+Cleanup signals **individual verified processes**: SIGTERM to each reviewed target, one shared three-second grace period, then another check before SIGKILL. Linux requires pidfds and has no plain-PID fallback. **macOS has a remaining identity-check/signal race**; it is reduced by immediate rechecking, not eliminated.
 
 Piped or JSON-mode apply is refused. The CLI has no `--yes`, automatic reaper, process-group kill or cgroup kill. Action intent is persisted before signaling, and outcomes remain in the local history.
 

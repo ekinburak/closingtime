@@ -43,18 +43,22 @@ enum Subcommands {
     /// List recorded runs and surviving processes.
     Sessions,
     /// Inspect resources belonging to recorded runs without changing the ledger.
-    Scan {
-        #[arg(long)]
-        session: Option<String>,
-    },
+    Scan(RunSelector),
     /// Explain a PID or a TCP listening port, including unknown ownership.
     Who(Who),
     /// Preview cleanup; --apply refreshes the plan and requires terminal approval.
     Clean {
-        #[arg(long)]
-        session: String,
+        #[command(flatten)]
+        run: RunSelector,
         #[arg(long)]
         apply: bool,
+    },
+    /// End a run whose supervisor crashed or stopped recording, once its root has exited.
+    Recover(RunSelector),
+    /// Forget runs from earlier boots and ledger events older than --event-days.
+    Prune {
+        #[arg(long, default_value_t = 30)]
+        event_days: u64,
     },
     /// Preserve a recorded process and its known descendants.
     Keep {
@@ -70,6 +74,15 @@ enum Subcommands {
     Doctor,
     /// Export the versioned ledger for another tool. Includes local action history.
     Export,
+}
+#[derive(Args)]
+struct RunSelector {
+    /// Run ID, or a unique prefix of one
+    #[arg(long)]
+    session: Option<String>,
+    /// The most recently started run
+    #[arg(long, conflicts_with = "session")]
+    last: bool,
 }
 #[derive(Args)]
 #[group(required = true, multiple = false)]
@@ -118,6 +131,8 @@ fn execute(cli: Cli) -> Result<i32> {
             | Subcommands::Keep { .. }
             | Subcommands::Unkeep { .. }
             | Subcommands::Clean { apply: true, .. }
+            | Subcommands::Recover(_)
+            | Subcommands::Prune { .. }
     );
     let dir = cli.state_dir.unwrap_or(default_state_dir()?);
     if matches!(cli.command, Subcommands::Clean { apply: true, .. })
@@ -136,7 +151,8 @@ fn execute(cli: Cli) -> Result<i32> {
             command,
         } => run(&engine, label, native_session_id, command),
         Subcommands::Sessions => {
-            let sessions = engine.store.sessions()?;
+            let mut sessions = engine.store.sessions()?;
+            sessions.sort_by_key(|s| s.started_ms);
             let scan = engine.scan(None)?;
             #[derive(Serialize)]
             struct Entry {
@@ -185,7 +201,8 @@ fn execute(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Subcommands::Scan { session } => {
+        Subcommands::Scan(selector) => {
+            let session = select(&engine, &selector)?;
             let scan = engine.scan(session.as_deref())?;
             show_scan(&scan, cli.json)?;
             Ok(if scan.resources.iter().any(|r| r.cleanup_eligible) {
@@ -203,7 +220,8 @@ fn execute(cli: Cli) -> Result<i32> {
             show_scan(&scan, cli.json)?;
             Ok(if scan.resources.is_empty() { 2 } else { 0 })
         }
-        Subcommands::Clean { session, apply } => {
+        Subcommands::Clean { run, apply } => {
+            let session = required(select(&engine, &run)?)?;
             let plan = engine.plan_cleanup(&session)?;
             if cli.json {
                 json(&plan)?;
@@ -263,6 +281,32 @@ fn execute(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+        Subcommands::Recover(selector) => {
+            let session = required(select(&engine, &selector)?)?;
+            engine.recover_session(&session)?;
+            if cli.json {
+                json(&serde_json::json!({"schema":SCHEMA,"session":session,"ended":true}))?;
+            } else {
+                println!(
+                    "Run {} ended. Preview: closingtime clean --session {}",
+                    safe(&session),
+                    safe(&session)
+                );
+            }
+            Ok(0)
+        }
+        Subcommands::Prune { event_days } => {
+            let pruned = engine.prune(Duration::from_secs(event_days.saturating_mul(86_400)))?;
+            if cli.json {
+                json(&serde_json::json!({"schema":SCHEMA,"pruned":pruned}))?;
+            } else {
+                println!(
+                    "Forgot {} runs, {} processes and {} keeps from earlier boots, and {} old events.",
+                    pruned.sessions, pruned.processes, pruned.keeps, pruned.events
+                );
+            }
+            Ok(0)
+        }
         Subcommands::Export => {
             let export = engine.store.export()?;
             json(&export)?;
@@ -317,7 +361,7 @@ fn run(
     };
     eprintln!("Closingtime run: {}", session.id);
     let mut last_observation = Instant::now() - Duration::from_secs(1);
-    let mut observation_error = None;
+    let mut observation_failures = 0usize;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -330,14 +374,16 @@ fn run(
             }
         }
         if last_observation.elapsed() >= Duration::from_millis(250) {
+            // A missed pass is a polling gap, not a false record: anything still running
+            // is picked up by the next pass, and unrecorded processes are never stopped.
             if let Err(e) = engine.observe() {
-                if observation_error.is_none() {
+                if observation_failures == 0 {
                     eprintln!(
-                        "Ownership observation interrupted: {}",
+                        "Ownership observation failed; retrying: {}",
                         safe(&e.to_string())
                     );
                 }
-                observation_error = Some(e.to_string());
+                observation_failures += 1;
             }
             last_observation = Instant::now();
         }
@@ -346,20 +392,30 @@ fn run(
     for id in handlers {
         signal_hook::low_level::unregister(id);
     }
-    if let Err(e) = engine.observe() {
-        observation_error = Some(e.to_string());
-    }
-    // Lost observation or ledger writes leave the end unconfirmed, never cleanup eligible.
-    if let Some(e) = observation_error {
-        return Err(
-            format!("run exited, but recording failed; cleanup remains blocked: {e}").into(),
-        );
+    // The final pass must succeed: a lost end leaves the run unconfirmed and report-only.
+    let mut last = engine.observe();
+    for _ in 0..3 {
+        if last.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        last = engine.observe();
     }
     use std::os::unix::process::ExitStatusExt;
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1));
-    engine.end_session(&session.id, &format!("exit:{code}"))?;
+    let mut outcome = format!("exit:{code}");
+    if observation_failures > 0 {
+        outcome += &format!("; {observation_failures} observation passes failed");
+    }
+    if let Err(e) = last.and_then(|_| engine.end_session(&session.id, &outcome)) {
+        return Err(format!(
+            "run exited, but recording failed; cleanup stays blocked until `closingtime recover --session {}`: {e}",
+            session.id
+        )
+        .into());
+    }
     let scan = engine.scan(Some(&session.id))?;
     let count = scan
         .resources
@@ -397,6 +453,35 @@ fn shared_foreground_group(child_pid: u32) -> bool {
         let _ = child_pid;
         false
     }
+}
+fn select(engine: &Engine<NativeBackend>, selector: &RunSelector) -> Result<Option<String>> {
+    let sessions = engine.store.sessions()?;
+    if selector.last {
+        return match sessions.into_iter().max_by_key(|s| s.started_ms) {
+            Some(s) => Ok(Some(s.id)),
+            None => Err("no recorded runs yet".into()),
+        };
+    }
+    let Some(query) = &selector.session else {
+        return Ok(None);
+    };
+    let matches: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.id.starts_with(query.as_str()))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(Some(one.id.clone())),
+        [] => Err(format!("no recorded run matches {}", safe(query)).into()),
+        _ => Err(format!(
+            "{} runs match {}; use more characters",
+            matches.len(),
+            safe(query)
+        )
+        .into()),
+    }
+}
+fn required(session: Option<String>) -> Result<String> {
+    session.ok_or_else(|| "choose a run with --session <id> or --last".into())
 }
 fn json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);

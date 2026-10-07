@@ -211,7 +211,7 @@ fn platform_identity() -> Result<(String, String)> {
     let machine = fs::read_to_string("/etc/machine-id")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or(fs::read_to_string("/proc/sys/kernel/hostname")?);
+        .map_or_else(|| fs::read_to_string("/proc/sys/kernel/hostname"), Ok)?;
     // Containers share a kernel boot ID. Never reuse identities across PID namespaces.
     let namespace = fs::read_link("/proc/self/ns/pid")?;
     let host = format!("{}:{}", machine.trim(), namespace.to_string_lossy());
@@ -248,7 +248,7 @@ fn read_linux_stat(pid: u32) -> io::Result<(String, u32, String, bool)> {
         stat[open + 1..close].into(),
         fields[1].parse().map_err(io::Error::other)?,
         fields[19].into(),
-        fields[0] == "Z",
+        matches!(fields[0], "Z" | "X"),
     ))
 }
 
@@ -479,7 +479,24 @@ fn bsd_info(pid: u32) -> io::Result<libc::proc_bsdinfo> {
 #[cfg(target_os = "macos")]
 fn mac_environment(pid: u32) -> io::Result<Vec<u8>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
-    let mut buffer = vec![0u8; 1024 * 1024];
+    // Arguments plus environment can reach kern.argmax; a smaller buffer fails with ENOMEM.
+    let mut argmax: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let argmax_ok = unsafe {
+        libc::sysctlbyname(
+            c"kern.argmax".as_ptr(),
+            (&mut argmax as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0;
+    let capacity = if argmax_ok && argmax > 0 {
+        argmax as usize
+    } else {
+        1024 * 1024
+    };
+    let mut buffer = vec![0u8; capacity];
     let mut len = buffer.len();
     if unsafe {
         libc::sysctl(
